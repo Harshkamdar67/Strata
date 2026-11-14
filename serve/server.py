@@ -1704,6 +1704,13 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # "priority": N (or "high" = 1) - the request's lane among the batch slots: while requests of different priority
+        # are live, the lower ones take fewer decode windows and give way during prompt reads.  Absent or 0: as before.
+        pr = sampling.get("priority")
+        if pr == "high":
+            pr = 1
+        if isinstance(pr, int) and not isinstance(pr, bool) and pr != 0:
+            keys += f" prio={max(-1000, min(1000, pr))}"
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)
@@ -2222,10 +2229,15 @@ class StrataEngine:
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
 
-    def _shorter_waiting(self, plen: int) -> bool:
-        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to."""
+    def _shorter_waiting(self, plen: int, prio: int = 0) -> bool:
+        """#656: someone waits for the control lines with a prompt under half this one's: worth giving way to.
+        Priority lanes: so is a waiting request of a higher "priority", whatever its length."""
         with self.slot_cv:
-            return any(e[0] * 2 <= plen for e in self.wait_lens)
+            return any(e[0] * 2 <= plen or getattr(e[4], "_strata_prio", 0) > prio for e in self.wait_lens)
+
+    def _higher_waiting(self, prio: int) -> bool:
+        with self.slot_cv:
+            return any(getattr(e[4], "_strata_prio", 0) > prio for e in self.wait_lens)
 
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
@@ -2241,6 +2253,12 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        prio = (sampling or {}).get("priority")
+        prio = 1 if prio == "high" else prio if isinstance(prio, int) and not isinstance(prio, bool) else 0
+        try:
+            cancel._strata_prio = prio      # read by a prompt read in flight: it gives way to a higher lane
+        except AttributeError:
+            pass
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2304,8 +2322,8 @@ class StrataEngine:
 
                     def give_way():   # at a PP line, and between two far apart (the engine takes it at its next boundary)
                         nonlocal reserved
-                        if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(len(prompt))):
+                        if (reserved is None and not out and not embeddings and (yields < self.YIELDS_MAX or self._higher_waiting(prio)) and
+                                self._shorter_waiting(len(prompt), prio)):
                             with self.slot_cv:          # the slot the part read will wait in
                                 reserved = self.pick_slot(prompt)
                                 if reserved is not None:
@@ -2444,8 +2462,8 @@ class StrataEngine:
 
                     def ask():        # as give_way above, for the slot this admission reads into
                         nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
-                                self._shorter_waiting(len(prompt))):
+                        if (not asked and not embeddings and (yields < self.YIELDS_MAX or self._higher_waiting(prio)) and
+                                self._shorter_waiting(len(prompt), prio)):
                             self._send_for(born, f"BYIELD {slot}")
                             asked = True
 

@@ -111,6 +111,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 
 #include <array>
 #include <chrono>
+#include <climits>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -9401,6 +9402,7 @@ int main(int argc, char **argv) try {
         // ---- --batch: the slots of the batch windows
         struct BSlot {
             bool active = false, stop = false;
+            int prio = 0;                  ///< its request's prio key: slots below the highest live priority take fewer windows
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
@@ -9641,11 +9643,25 @@ int main(int argc, char **argv) try {
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
+            // priority lanes: while slots of different priority are live, a slot g levels below the highest joins one
+            // window in g * STRATA_LANE_SHARE (default 4, 0 = it waits); with one priority every slot is in every window
+            static const int lane_share = [] {
+                const char* v = std::getenv("STRATA_LANE_SHARE");
+                return v != nullptr ? std::max(0, std::atoi(v)) : 4;
+            }();
+            static uint64_t lane_tick = 0;
+            int lane_top = INT_MIN;
+            for (const BSlot& ls : bs) if (ls.active) lane_top = std::max(lane_top, ls.prio);
+            ++lane_tick;
+            auto lane_in = [&](const BSlot& ls) {
+                const int64_t gap = (int64_t) lane_top - ls.prio;
+                return gap <= 0 || (lane_share > 0 && lane_tick % (uint64_t) (gap * lane_share) == 0);
+            };
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
-                if (bs[(size_t) b].active) {
+                if (bs[(size_t) b].active && lane_in(bs[(size_t) b])) {
                     first[A] = S;
                     active[A++] = b;
                     rows[S] = b;
@@ -9671,7 +9687,15 @@ int main(int argc, char **argv) try {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
-            apply_pending(false);
+            // the adaptive tier in the batch windows (STRATA_BATCH_ADAPT=0: off, as before): without it the VRAM tier
+            // stays as the last solo request left it, and slots on other text run half their experts on the CPU
+            static const bool batch_adapt = [] { const char* v = std::getenv("STRATA_BATCH_ADAPT"); return v == nullptr || v[0] != '0'; }();
+            // (not while a prompt's loan is out: its experts are marked missing, the tier would swap them into other
+            // slots, and the refill then puts them back into theirs)
+            bool loan_out = false;
+            for (const PfPart& lp : pf_parts) loan_out = loan_out || !lp.lent.empty();
+            const bool adapt_here = batch_adapt && !loan_out && !drive.d.usage.empty() && o.adapt_async == 0 && o.adapt_every > 0;
+            apply_pending(adapt_here);   // (the previous round's copies land first, as in the solo loop: #463)
             if (bt_windows == 0) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -9698,8 +9722,13 @@ int main(int argc, char **argv) try {
                 keep[b] = batch_mtp && outb[i] == tok[i + 1] && !eos && !sl.stop &&
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
-            if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
-                std::printf("ERR %s\n", err.c_str());
+            std::thread adapt_thr;   // beside the commit, as the solo loop does
+            bool adapt_ok = true;
+            if (adapt_here && ((bt_windows + 1) % o.adapt_every) == 0) adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+            const bool committed = batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err);
+            if (adapt_thr.joinable()) adapt_thr.join();
+            if (!committed || !adapt_ok) {
+                std::printf("ERR %s\n", committed ? "an adaptive refill failed" : err.c_str());
                 return false;
             }
             const Clock::time_point w2 = Clock::now();
@@ -10190,6 +10219,7 @@ int main(int argc, char **argv) try {
             float req_temperature = 0.0f, req_top_p = 1.0f;
             int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
             unsigned long long req_seed = 0;
+            int req_prio = 0;   // prio=N: the request's lane (see batch_step)
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             long long req_pen_from = -1;   // pen_from=N: this request continues one that began at token N (the last token of the original prompt): the penalty window starts there
@@ -10236,6 +10266,7 @@ int main(int argc, char **argv) try {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    else if (key == "prio") req_prio = std::clamp(std::atoi(tok.c_str() + eq + 1), -1000, 1000);
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
                     else if (key == "allowed") {
                         const std::string csv = tok.substr(eq + 1);
@@ -11066,12 +11097,55 @@ int main(int argc, char **argv) try {
             // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
             // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
+            // priority lanes: a batched read below a decoding slot's priority waits for that reply to end - before it
+            // borrows cache slots and before each chunk (a chunk stops every slot, and a loan takes the higher lane's
+            // experts off the card).  A higher request that arrives during the read is the server's BYIELD.
+            double lane_waited_ms = 0;   // this request's waits so far (its parts and chunks share one allowance)
+            auto lane_wait = [&](std::string& e) -> bool {
+                // STRATA_LANE_WAIT_MS (default 4000): the most one request waits; a reply longer than that then shares the
+                // card with the read, so the lower request is not held for a whole long answer.  Below 0: no limit.
+                static const double lane_wait_ms = [] {
+                    const char* v = std::getenv("STRATA_LANE_WAIT_MS");
+                    return v != nullptr ? std::atof(v) : 4000.0;
+                }();
+                bool stepped = false;
+                const auto t_lw = Clock::now();
+                for (;;) {
+                    bool above = false;
+                    for (const BSlot& ls : bs) above = above || (ls.active && ls.prio > req_prio);
+                    const double waited = lane_waited_ms + std::chrono::duration<double, std::milli>(Clock::now() - t_lw).count();
+                    if (above && lane_wait_ms >= 0.0 && waited >= lane_wait_ms) above = false;
+                    if (!above) {
+                        // the windows' adaptive swaps land before the read lends any slot (as at a request's start)
+                        if (stepped) apply_pending(true);
+                        lane_waited_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_lw).count();
+                        return true;
+                    }
+                    stepped = true;
+                    {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        for (auto it = in_lines.begin(); it != in_lines.end();) {
+                            if (it->rfind("BSTOP ", 0) == 0) {
+                                const int b = std::atoi(it->c_str() + 6);
+                                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                it = in_lines.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    const auto tw = Clock::now();
+                    if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
+                    il_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+                }
+            };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
                 // (a layer split reads its stages as a pipeline over one run's chunks: in pieces only beside slots)
                 if (o.batch <= 0 || piped || (!stages.empty() && !batch_on())) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
+                    if (!lane_wait(e)) return false;
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;
@@ -11110,6 +11184,7 @@ int main(int argc, char **argv) try {
                             sl.partial = true;
                             sl.partial_from0 = read_from == 0 || resumed_from0;
                             sl.cvec = cvec_cached;
+                            sl.prio = req_prio;
                             for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
                                 if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
                                         [](int32_t x, int64_t y) { return (int64_t) x == y; }))
@@ -11126,8 +11201,13 @@ int main(int argc, char **argv) try {
                         std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
                                      (long long) n, ye.empty() ? "" : ": ", ye.c_str());
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    // priority lanes: a prompt read above the decoding slots' priority is not interleaved with them
+                    // (one below them waits for their replies before each chunk, above)
+                    int live_top = INT_MIN;
+                    for (const BSlot& ls : bs) if (ls.active) live_top = std::max(live_top, ls.prio);
+                    const double share = live_top < req_prio ? 0.0 : decode_share;
+                    if (share <= 0.0 || !batch_on()) continue;
+                    const double budget = share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     do {
                         if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
@@ -11225,6 +11305,10 @@ int main(int argc, char **argv) try {
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
+                    return 1;
+                }
+                if (!win && o.batch > 0 && !lane_wait(err)) {
+                    std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
                 if (!win && !lend(to - at, err)) {
@@ -12599,6 +12683,7 @@ int main(int argc, char **argv) try {
                         sl.draft_ready = true;
                     }
                     sl.cvec = cvec_cached;
+                    sl.prio = req_prio;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
                     const ConvCheckpoint* best = nullptr;
                     for (const ConvCheckpoint& c : checks)
